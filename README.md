@@ -1,3 +1,71 @@
+diff --git a/README.md b/README.md
+index 5e8e264f778d120212eca4f5930fa10b65047a03..a6a558f3ebecf88044f3b8a30d89c5c6537941ed 100644
+--- a/README.md
++++ b/README.md
+@@ -84,50 +84,63 @@ Current Large Language Models:
+ 
+ ### High-Level Pipeline
+ 
+ ```
+ 
+ Input Tokens
+ ↓
+ Base Model (Transformer / LLM)
+ ↓
+ MetaAttention Module
+ ↓
+ Meta-Representation (Global Reasoning State)
+ ↓
+ ├── Rule Induction Head
+ ├── Epistemic Confidence Head (Know / Infer / Unsure)
+ ├── Self-Critique Loop (Coherence Score)
+ ↓
+ Decision Layer
+ ↓
+ Answer / Revise / Abstain
+ 
+ ```
+ 
+ ---
+ 
++## ⚙️ Hardware-Inspired Reasoning View
++
++GMAA can also be understood through low-level computer architecture principles:
++
++- **Rule induction ↔ logic composition:** the rule head learns reusable decision patterns, analogous to composing simple boolean primitives (AND/OR/XOR) into richer circuits.
++- **Meta-attention ↔ control logic:** the global meta-query behaves like a control unit signal that coordinates which internal states are relevant for the next operation.
++- **Self-critique ↔ feedback paths:** coherence scoring introduces a feedback loop, similar to sequential logic where prior state influences the next state transition.
++- **Epistemic confidence ↔ status flags:** `Know / Infer / Unsure` resembles machine status bits that guide downstream branching (`accept / revise / abstain`).
++
++This analogy does **not** claim GMAA is digital logic in disguise; instead, it offers an engineering mental model for designing verifiable, stepwise reasoning behavior in neural systems.
++
++---
++
+ ## 🔬 MetaAttention: Core Innovation
+ 
+ ### Standard Self-Attention (Transformer)
+ 
+ Each token attends to other tokens:
+ 
+ \[
+ \text{Attention}(Q,K,V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d}}\right)V
+ \]
+ 
+ This captures **syntactic and semantic relations**, but not reasoning quality.
+ 
+ ---
+ 
+ ### MetaAttention (GMAA)
+ 
+ MetaAttention computes a **global query** from the model’s internal state:
+ 
+ \[
+ \bar{h} = \frac{1}{n}\sum_{i=1}^{n} h_i
+ \]
+ 
+ \[
+ Q = W_q \bar{h}, \quad K = W_k H, \quad V = W_v H
+ \]
 
 
 ---
