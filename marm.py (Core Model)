@@ -2,46 +2,251 @@ import torch
 import torch.nn as nn
 from meta_attention import MetaAttention
 
+
 class MARM(nn.Module):
     """
-    MetaAttention Reasoning Model
+    MetaAttention Reasoning Model (MARM)
+    
+    A reasoning-centric neural architecture that extends Transformers with:
+    - Meta-attention for analyzing reasoning patterns
+    - Epistemic confidence estimation (know/infer/unsure)
+    - Self-critique for output evaluation
+    - Text generation with temperature sampling
+    
+    This enables models to reason about their own reasoning and detect uncertainty.
+    
+    Args:
+        vocab_size (int): Size of vocabulary
+        d_model (int): Model dimension (default: 256)
+        layers (int): Number of encoder layers (default: 4)
+        heads (int): Number of attention heads (default: 4)
+        max_seq_length (int): Maximum sequence length (default: 512)
+        dropout (float): Dropout rate (default: 0.1)
     """
-
-    def __init__(self, vocab_size, d_model=256, layers=4, heads=4):
+    
+    def __init__(self, vocab_size: int, d_model: int = 256, layers: int = 4, 
+                 heads: int = 4, max_seq_length: int = 512, dropout: float = 0.1):
         super().__init__()
-
+        
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.layers = layers
+        self.heads = heads
+        self.max_seq_length = max_seq_length
+        
+        # Token embedding
         self.embed = nn.Embedding(vocab_size, d_model)
-
+        
+        # Positional encoding (learnable)
+        self.pos_embed = nn.Embedding(max_seq_length, d_model)
+        
+        # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=heads,
-            batch_first=True
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            batch_first=True,
+            activation='gelu'
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, layers)
-
-        self.meta_attention = MetaAttention(d_model)
-
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=layers)
+        
+        # Meta-attention layer for reasoning
+        self.meta_attention = MetaAttention(d_model, num_heads=heads, dropout=dropout)
+        
         # Language modeling head
         self.lm_head = nn.Linear(d_model, vocab_size)
-
-        # Epistemic heads
-        self.epistemic_head = nn.Linear(d_model, 3)  # know / infer / unsure
-        self.critique_head = nn.Linear(d_model, 1)
-
-    def forward(self, input_ids):
+        
+        # Epistemic head: predicts (know, infer, unsure) probabilities
+        self.epistemic_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, 3)
+        )
+        
+        # Critique head: self-evaluation score [0, 1]
+        self.critique_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid()
+        )
+        
+        # Dropout for regularization
+        self.dropout = nn.Dropout(dropout)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize model weights."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, std=0.02)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
+    
+    def forward(self, input_ids: torch.Tensor) -> dict:
         """
-        input_ids: [batch, seq_len]
+        Forward pass through MARM.
+        
+        Args:
+            input_ids (Tensor): Token IDs [batch_size, seq_length]
+        
+        Returns:
+            dict: Contains:
+                - logits: LM predictions [batch_size, seq_length, vocab_size]
+                - epistemic: Confidence distribution [batch_size, 3]
+                - critique: Self-evaluation scores [batch_size, 1]
         """
-        H = self.encoder(self.embed(input_ids))
-
-        meta_repr = self.meta_attention(H).squeeze(1)
-
-        logits = self.lm_head(H)
-        epistemic = torch.softmax(self.epistemic_head(meta_repr), dim=-1)
-        critique = torch.sigmoid(self.critique_head(meta_repr))
-
+        batch_size, seq_length = input_ids.shape
+        
+        # Token embedding
+        x = self.embed(input_ids)  # [batch_size, seq_length, d_model]
+        
+        # Add positional encoding
+        positions = torch.arange(seq_length, device=input_ids.device).unsqueeze(0)
+        x = x + self.pos_embed(positions)
+        x = self.dropout(x)
+        
+        # Transformer encoder
+        H = self.encoder(x)  # [batch_size, seq_length, d_model]
+        
+        # Meta-attention: analyze reasoning patterns
+        meta_repr = self.meta_attention(H)  # [batch_size, 1, d_model]
+        meta_repr = meta_repr.squeeze(1)    # [batch_size, d_model]
+        
+        # Language modeling head
+        logits = self.lm_head(H)  # [batch_size, seq_length, vocab_size]
+        
+        # Epistemic head: confidence estimation
+        epistemic_logits = self.epistemic_head(meta_repr)  # [batch_size, 3]
+        epistemic = torch.softmax(epistemic_logits, dim=-1)
+        
+        # Critique head: self-evaluation
+        critique = self.critique_head(meta_repr)  # [batch_size, 1]
+        
         return {
             "logits": logits,
-            "epistemic": epistemic,
-            "critique": critique
+            "epistemic": epistemic,  # [batch_size, 3] - (know, infer, unsure)
+            "critique": critique,     # [batch_size, 1] - confidence score
         }
+    
+    def generate(self, prompt_ids: torch.Tensor, max_length: int = 100,
+                temperature: float = 1.0, top_k: int = 50,
+                top_p: float = 0.9, device: str = "cpu") -> torch.Tensor:
+        """
+        Generate text autoregressively.
+        
+        Args:
+            prompt_ids (Tensor): Initial token IDs
+            max_length (int): Maximum generation length
+            temperature (float): Sampling temperature
+            top_k (int): Top-k sampling parameter
+            top_p (float): Top-p (nucleus) sampling parameter
+            device (str): Device to use
+        
+        Returns:
+            Tensor: Generated token sequence
+        """
+        self.eval()
+        generated = prompt_ids.clone().to(device)
+        
+        with torch.no_grad():
+            for _ in range(max_length):
+                # Forward pass
+                output = self.forward(generated)
+                logits = output["logits"][:, -1, :]  # Last token logits
+                
+                # Temperature scaling
+                logits = logits / temperature
+                
+                # Top-k filtering
+                top_k_logits, top_k_indices = torch.topk(logits, top_k)
+                logits = torch.full_like(logits, float('-inf'))
+                logits.scatter_(1, top_k_indices, top_k_logits)
+                
+                # Top-p (nucleus) sampling
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumsum = torch.cumsum(
+                    torch.softmax(sorted_logits, dim=-1), dim=-1
+                )
+                sorted_indices_to_remove = cumsum > top_p
+                sorted_indices_to_remove[..., 0] = False
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                logits[:, indices_to_remove] = float('-inf')
+                
+                # Sample next token
+                probs = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                
+                generated = torch.cat([generated, next_token], dim=1)
+        
+        return generated
+    
+    def get_config(self) -> dict:
+        """
+        Get model configuration.
+        
+        Returns:
+            dict: Model hyperparameters
+        """
+        return {
+            "vocab_size": self.vocab_size,
+            "d_model": self.d_model,
+            "layers": self.layers,
+            "heads": self.heads,
+            "max_seq_length": self.max_seq_length,
+            "total_parameters": sum(p.numel() for p in self.parameters()),
+        }
+
+
+if __name__ == "__main__":
+    print("\n" + "="*70)
+    print("MARM Model Demonstration")
+    print("="*70 + "\n")
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}\n")
+    
+    # Create model
+    vocab_size = 30522
+    model = MARM(vocab_size=vocab_size).to(device)
+    
+    # Print config
+    config = model.get_config()
+    print("Model Configuration:")
+    for key, value in config.items():
+        print(f"  {key}: {value}")
+    print()
+    
+    # Forward pass example
+    batch_size, seq_length = 2, 16
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_length)).to(device)
+    
+    with torch.no_grad():
+        output = model(input_ids)
+    
+    print("Output Shapes:")
+    print(f"  logits: {output['logits'].shape}")
+    print(f"  epistemic: {output['epistemic'].shape}")
+    print(f"  critique: {output['critique'].shape}")
+    print()
+    
+    print("Epistemic Analysis (batch 0):")
+    epistemic = output['epistemic'][0]
+    print(f"  Know: {epistemic[0]:.3f}")
+    print(f"  Infer: {epistemic[1]:.3f}")
+    print(f"  Unsure: {epistemic[2]:.3f}")
+    print()
+    
+    print(f"Self-Critique Score: {output['critique'][0][0]:.3f}")
+    
+    print("\n" + "="*70)
