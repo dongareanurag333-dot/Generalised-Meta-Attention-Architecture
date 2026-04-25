@@ -2,6 +2,144 @@ import torch
 from transformers import AutoTokenizer
 from marm import MARM
 
+
+class HybridLLMMARM:
+    """
+    Hybrid LLM + MARM Integration
+    
+    Combines LLM outputs with MARM for:
+    - Confidence-based decision making
+    - Quality ranking of multiple answers
+    - Hallucination detection
+    - Epistemic analysis
+    """
+    
+    def __init__(self, marm_model_path: str = None, device: str = None):
+        """
+        Initialize hybrid system.
+        
+        Args:
+            marm_model_path (str): Path to trained MARM model
+            device (str): Device to use ('cuda' or 'cpu')
+        """
+        if device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+        
+        self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        self.marm = MARM(vocab_size=self.tokenizer.vocab_size).to(self.device)
+        
+        if marm_model_path:
+            self.marm.load_state_dict(torch.load(marm_model_path, map_location=self.device))
+        
+        self.marm.eval()
+    
+    def evaluate_answer(self, answer: str) -> dict:
+        """
+        Evaluate a single answer using MARM.
+        
+        Args:
+            answer (str): Answer text to evaluate
+        
+        Returns:
+            dict: Epistemic analysis of the answer
+        """
+        tokens = self.tokenizer(
+            answer,
+            return_tensors="pt",
+            truncation=True,
+            padding=True
+        )["input_ids"].to(self.device)
+        
+        with torch.no_grad():
+            output = self.marm(tokens)
+        
+        know, infer, unsure = output["epistemic"][0].tolist()
+        critique = output["critique"][0].item()
+        
+        return {
+            "know": know,
+            "infer": infer,
+            "unsure": unsure,
+            "critique": critique
+        }
+    
+    def hybrid_decision(self, answer: str, unsure_threshold: float = 0.45, 
+                       critique_threshold: float = 0.4) -> dict:
+        """
+        Make decision on answer acceptance based on confidence and critique.
+        
+        Args:
+            answer (str): Answer to evaluate
+            unsure_threshold (float): Uncertainty threshold for abstention
+            critique_threshold (float): Critique score threshold
+        
+        Returns:
+            dict: Decision (ACCEPT/ABSTAIN) with epistemic breakdown
+        """
+        score = self.evaluate_answer(answer)
+        
+        # Decision logic: abstain if uncertain or low critique
+        if score["unsure"] > unsure_threshold or score["critique"] < critique_threshold:
+            decision = "ABSTAIN"
+        else:
+            decision = "ACCEPT"
+        
+        return {
+            "decision": decision,
+            "epistemic": score,
+            "confidence": max(score["know"], score["infer"], 1 - score["unsure"])
+        }
+    
+    def quality_ranked_answers(self, answers: list) -> list:
+        """
+        Rank multiple answers by quality.
+        
+        Args:
+            answers (list): List of answer strings
+        
+        Returns:
+            list: Answers ranked by quality score
+        """
+        ranked = []
+        
+        for answer in answers:
+            score = self.evaluate_answer(answer)
+            quality = (score["know"] + (1 - score["unsure"]) + score["critique"]) / 3
+            
+            ranked.append({
+                "answer": answer,
+                "quality_score": quality,
+                "epistemic": score
+            })
+        
+        # Sort by quality score (descending)
+        ranked.sort(key=lambda x: x["quality_score"], reverse=True)
+        
+        return ranked
+    
+    def batch_evaluate(self, answers: list) -> list:
+        """
+        Evaluate multiple answers.
+        
+        Args:
+            answers (list): List of answer strings
+        
+        Returns:
+            list: List of evaluation results
+        """
+        results = []
+        for answer in answers:
+            result = self.hybrid_decision(answer)
+            result["answer"] = answer
+            results.append(result)
+        return results
+
+
+# Legacy interface for backward compatibility
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 tokenizer.pad_token = tokenizer.eos_token
 
@@ -10,7 +148,9 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 marm = MARM(vocab_size=tokenizer.vocab_size).to(device)
 marm.eval()
 
+
 def evaluate_answer(answer: str):
+    """Legacy function for answer evaluation."""
     tokens = tokenizer(
         answer,
         return_tensors="pt",
@@ -30,7 +170,9 @@ def evaluate_answer(answer: str):
         "critique": out["critique"].item()
     }
 
+
 def hybrid_decision(answer: str):
+    """Legacy function for hybrid decision making."""
     score = evaluate_answer(answer)
 
     if score["unsure"] > 0.45 or score["critique"] < 0.4:
@@ -43,3 +185,38 @@ def hybrid_decision(answer: str):
         "decision": "ACCEPT",
         "epistemic": score
     }
+
+
+if __name__ == "__main__":
+    print("\n" + "="*60)
+    print("Hybrid LLM + MARM Demonstration")
+    print("="*60 + "\n")
+    
+    hybrid = HybridLLMMARM()
+    
+    # Test answers
+    test_answers = [
+        "Paris is the capital of France.",
+        "2 + 2 = 5",
+        "Water boils at 100 degrees Celsius at sea level.",
+        "The moon is made of green cheese.",
+        "Artificial intelligence is transforming technology."
+    ]
+    
+    print("1. Individual Answer Evaluation:")
+    print("-" * 60)
+    for answer in test_answers[:2]:
+        result = hybrid.hybrid_decision(answer)
+        print(f"Answer: {answer}")
+        print(f"Decision: {result['decision']}")
+        print(f"Epistemic: Know={result['epistemic']['know']:.3f}, "
+              f"Infer={result['epistemic']['infer']:.3f}, "
+              f"Unsure={result['epistemic']['unsure']:.3f}\n")
+    
+    print("\n2. Quality Ranking:")
+    print("-" * 60)
+    ranked = hybrid.quality_ranked_answers(test_answers)
+    for i, result in enumerate(ranked[:3], 1):
+        print(f"{i}. Score: {result['quality_score']:.3f} | {result['answer']}")
+    
+    print("\n" + "="*60)
